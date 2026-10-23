@@ -47,6 +47,27 @@ def test_manual_application_flow_requires_and_records_confirmation(client):
     assert duplicate.status_code == 409
 
 
+def test_reanalyze_jobs_uses_current_saved_titles(client):
+    token = register(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    with TestSession() as db:
+        from app.models import User
+        user = db.query(User).filter_by(email="candidate@example.com").one()
+        db.add(Resume(user_id=user.id, filename="candidate.txt", content_type="text/plain", storage_key="synthetic-only", parsed_data={"skills": ["SQL"], "explicit_skills": ["SQL"], "years_of_experience": 1, "experience": []}, extracted_text="synthetic fixture"))
+        db.commit()
+    job = client.post("/api/jobs", headers=headers, json={"platform": "mock", "platform_job_id": "reanalyze-1", "title": "Data Analyst", "company": "Example", "location": "Surat", "skills": ["SQL"], "application_url": "https://example.com/jobs/1"})
+    assert job.status_code == 201, job.text
+    initial = client.post(f"/api/jobs/{job.json()['id']}/analyze", headers=headers)
+    assert initial.status_code == 200, initial.text
+    updated_profile = client.put("/api/profile", headers=headers, json={"professional": {"target_job_titles": ["Data Analyst"]}})
+    assert updated_profile.status_code == 200, updated_profile.text
+    result = client.post("/api/jobs/reanalyze", headers=headers)
+    assert result.status_code == 200, result.text
+    assert result.json()["count"] == 1
+    refreshed = client.get("/api/jobs", headers=headers).json()[0]
+    assert refreshed["match"]["score"] > initial.json()["match_score"]
+
+
 def test_registration_rejects_weak_password(client):
     response = client.post("/api/auth/register", json={"email": "weak@example.com", "password": "short"})
     assert response.status_code == 422

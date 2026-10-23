@@ -138,7 +138,7 @@ function renderPlatformSearchLinks() {
   const locations = splitList($("locations").value || (state.profile.preferences?.preferred_locations || []).join(", "));
   const title = titles[0] || "";
   const location = locations[0] || "India";
-  const keyword = title;
+  const keyword = titles.join(" OR ");
   const slug = value => String(value).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
   const indeed = new URL("https://in.indeed.com/jobs");
   if (keyword) indeed.searchParams.set("q", keyword);
@@ -152,7 +152,7 @@ function renderPlatformSearchLinks() {
   if (title) apna.searchParams.set("query", title);
   if (location) apna.searchParams.set("location", location);
   const links = [
-    ["Naukri", `https://www.naukri.com/${slug(keyword) ? `${slug(keyword)}-jobs-in-` : "jobs-in-"}${slug(location.toLowerCase().includes("remote") ? "india" : location) || "india"}`],
+    ["Naukri", `https://www.naukri.com/${slug(title) ? `${slug(title)}-jobs-in-` : "jobs-in-"}${slug(location.toLowerCase().includes("remote") ? "india" : location) || "india"}`],
     ["Indeed", indeed.href], ["Apna", apna.href], ["LinkedIn", linkedin.href],
   ];
   box.innerHTML = links.map(([name, url]) => `<a class="platform-search-link" href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(name)} ↗</a>`).join("");
@@ -279,12 +279,18 @@ $("save-preferences").onclick = async () => {
     };
     await api("/profile", {method: "PUT", body: JSON.stringify(profile)});
     await api("/preferences", {method: "PATCH", body: JSON.stringify(preferences)});
-    showMessage("message", "Preferences saved.");
+    let summary = "Preferences saved.";
+    if (state.resumes.length) {
+      const result = await api("/jobs/reanalyze", {method: "POST"});
+      summary = `Preferences saved. Re-scored ${result.count} jobs against your resume.`;
+    }
     await loadAll();
+    showMessage("message", summary);
   } catch (err) { showMessage("message", err.message, true); }
 };
 $("score").oninput = () => { $("score-label").textContent = `${$("score").value}%`; renderJobs(); };
-$("minimum-salary").oninput = $("locations").oninput = $("excluded-keywords").oninput = () => renderJobs();
+$("minimum-salary").oninput = $("excluded-keywords").oninput = () => renderJobs();
+$("locations").oninput = () => { renderJobs(); renderPlatformSearchLinks(); };
 $("remote-allowed").onchange = () => renderJobs();
 $("target-titles").oninput = () => renderPlatformSearchLinks();
 $("notice-resume").onclick = () => $("resume-panel").scrollIntoView({behavior: "smooth"});

@@ -529,6 +529,22 @@ def analyze(job_id: UUID, user: User = Depends(current_user), db: Session = Depe
     return result
 
 
+@router.post("/jobs/reanalyze")
+def reanalyze_jobs(limit: int = 200, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Re-score the latest listings against the user's current resume and saved criteria."""
+    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+    if not resumes:
+        raise HTTPException(400, "Upload a resume before re-scoring jobs")
+    profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
+    limit = max(1, min(limit, 200))
+    jobs = db.scalars(select(Job).order_by(desc(Job.posted_at).nulls_last(), desc(Job.created_at)).limit(limit)).all()
+    for job in jobs:
+        analyze_job(job, user, db, resumes=resumes, profile=profile)
+    _audit(db, user.id, "JOBS_REANALYZED", "job", detail={"count": len(jobs)})
+    db.commit()
+    return {"count": len(jobs), "resume_used_for_matching": True, "resume_sent_to_feeds": False}
+
+
 @router.post("/jobs/discover-mock")
 def discover_mock(user: User = Depends(current_user), db: Session = Depends(get_db)):
     discovered = []
