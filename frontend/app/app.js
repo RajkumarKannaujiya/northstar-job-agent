@@ -61,7 +61,7 @@ async function loadAll() {
     $("m-matched").textContent = state.jobs.filter(job => job.match && job.match.score >= 85).length;
     $("m-applied").textContent = dash.applications_submitted;
     $("m-pending").textContent = dash.pending_actions;
-    $("score").value = profile.preferences?.minimum_match_score ?? 80;
+    $("score").value = profile.preferences?.minimum_match_score ?? 0;
     $("score-label").textContent = `${$("score").value}%`;
     $("locations").value = (profile.preferences?.preferred_locations || []).join(", ");
     $("profile-name").value = profile.personal?.full_name || "";
@@ -85,7 +85,7 @@ async function loadAll() {
 function renderJobs() {
   const list = $("job-list");
   if (!state.jobs.length) { list.innerHTML = '<div class="empty-state">Search public feeds to load listings, or search the job sites above.</div>'; return; }
-  const minimumScore = Number($("score").value || state.profile.preferences?.minimum_match_score || 0);
+  const minimumScore = Number($("score").value || 0);
   const minimumSalary = Number($("minimum-salary").value || 0);
   const preferredLocations = splitList($("locations").value).map(value => value.toLowerCase());
   const excludedKeywords = splitList($("excluded-keywords").value).map(value => value.toLowerCase());
@@ -108,6 +108,7 @@ function renderJobs() {
   });
   const visible = state.showAllJobs ? matching : matching.slice(0, 6);
   $("view-jobs").textContent = state.showAllJobs ? "Top jobs ↑" : `All jobs (${matching.length}) →`;
+  if (!matching.length) { list.innerHTML = '<div class="empty-state">No listings match these filters. Lower the match score or relax the location, salary, or excluded-keyword filters.</div>'; return; }
   list.innerHTML = visible.map(j => {
     const sourceNames = [...new Set((j.sources || []).map(source => ({remoteok: "Remote OK", remotive: "Remotive", greenhouse: "Greenhouse", lever: "Lever"}[source.platform] || source.platform)))];
     return `<article class="job-card"><div><div class="job-title">${esc(j.title)}</div><div class="job-company">${esc(j.company)}${sourceNames.length ? ` · ${esc(sourceNames.join(", "))}` : ""}</div><div class="job-meta"><span>⌖ ${esc(j.location || "Location not listed")}</span><span>◷ ${j.posted_at ? timeAgo(j.posted_at) : "Date unknown"}</span><span>${j.salary_min ? money(j.salary_min, j.currency) : "Salary undisclosed"}</span></div></div><div class="score">${j.match ? `${Math.round(j.match.score)}%` : "—"}</div><div class="job-actions"><a href="${safeUrl(j.application_url)}" target="_blank" rel="noreferrer">View job ↗</a><button data-analyze="${esc(j.id)}">Analyze fit</button><button data-apply="${esc(j.id)}">Track application</button></div></article>`;
