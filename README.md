@@ -81,6 +81,8 @@ To connect the dashboard, deploy the API and its database/worker services separa
 
 For a $0 hobby host that can run this existing full stack, see [`deploy/oracle/README.md`](deploy/oracle/README.md). It uses GitHub Pages for the dashboard and an Oracle Always Free VM for FastAPI, PostgreSQL, Redis, Celery, persistent encrypted resumes, and Caddy HTTPS. It requires the user to create the cloud account, DNS name, and secrets; free-tier capacity and uptime are not guaranteed.
 
+For a no-VM hobby alternative, see [`deploy/koyeb/README.md`](deploy/koyeb/README.md). It runs the API on Koyeb Free, with Supabase Free PostgreSQL/private S3-compatible storage and GitHub Actions for scheduled discovery. This route has cold starts, limited resources/storage, no hosted Celery worker, and possible Supabase pausing; it is not an always-on production host.
+
 The existing Docker Compose stack is the local full-stack route. A public GitHub Pages site can host only the dashboard. No hosted provider offers this entire stateful FastAPI, PostgreSQL, Redis, Celery, scheduler, and persistent resume-storage stack with a production uptime guarantee at $0. Free plans have limits: for example, Render free web services sleep after 15 minutes of inactivity, free Postgres expires after 30 days, local disks/background workers are unavailable on free compute, and Supabase free projects pause after a week of inactivity. These can support a hobby preview, not reliable long-running job automation or sole-copy resume storage. See [Render free-instance limits](https://render.com/docs/free) and [Supabase pricing](https://supabase.com/pricing). Use backups and durable database/storage before storing irreplaceable personal data.
 
 ## Tests
