@@ -44,18 +44,21 @@ async function auth(mode) {
 async function loadAll() {
   try {
     const [dash, jobs, apps, resumes, profile, platforms, boards, notifications, automation] = await Promise.all([
-      api("/dashboard"), api("/jobs?limit=100"), api("/applications"), api("/resumes"), api("/profile"),
+      api("/dashboard"), api("/jobs?limit=200"), api("/applications"), api("/resumes"), api("/profile"),
       api("/platforms"), api("/platforms/company-careers"), api("/notifications"), api("/automation/status"),
     ]);
-    state.jobs = jobs;
+    state.jobs = jobs.filter(job => {
+      const platforms = (job.sources || []).map(source => source.platform);
+      return !platforms.length || platforms.some(platform => platform !== "mock");
+    });
     state.applications = apps;
     state.resumes = resumes;
     state.platforms = platforms;
     state.boards = boards.boards || [];
     state.notifications = notifications;
     state.profile = profile;
-    $("m-discovered").textContent = dash.jobs_discovered;
-    $("m-matched").textContent = dash.high_match_jobs;
+    $("m-discovered").textContent = state.jobs.length;
+    $("m-matched").textContent = state.jobs.filter(job => job.match && job.match.score >= 85).length;
     $("m-applied").textContent = dash.applications_submitted;
     $("m-pending").textContent = dash.pending_actions;
     $("score").value = profile.preferences?.minimum_match_score ?? 80;
@@ -66,13 +69,13 @@ async function loadAll() {
     $("target-titles").value = (profile.professional?.target_job_titles || []).join(", ");
     $("minimum-salary").value = profile.preferences?.minimum_salary ?? "";
     $("excluded-keywords").value = (profile.preferences?.excluded_keywords || []).join(", ");
-    $("remote-allowed").checked = Boolean(profile.preferences?.remote_allowed);
+    $("remote-allowed").checked = profile.preferences?.remote_allowed !== false;
     $("automation-state").textContent = automation.active ? "SCHEDULED" : "PAUSED";
     $("automation-help").textContent = automation.scheduler_configured
       ? "Opt in for scheduled discovery. Remote OK refreshes about every six hours; Remotive refreshes daily. Review and submit each application on its source site."
       : "Search job feeds now. Scheduled refresh is not configured on the server yet, so use Search job feeds whenever you want an update.";
     $("start-automation").disabled = !automation.scheduler_configured;
-    renderJobs(); renderApps(); renderResumes(); renderPlatforms(); renderBoards(); renderNotifications();
+    renderJobs(); renderPlatformSearchLinks(); renderApps(); renderResumes(); renderPlatforms(); renderBoards(); renderNotifications();
   } catch (err) {
     showMessage("message", err.message, true);
     if (err.message.includes("Authentication")) { sessionStorage.removeItem(tokenKey); setAuthenticated(false); }
@@ -81,8 +84,28 @@ async function loadAll() {
 
 function renderJobs() {
   const list = $("job-list");
-  if (!state.jobs.length) { list.innerHTML = '<div class="empty-state">Choose Search job feeds to find remote listings, or add a company board.</div>'; return; }
-  const matching = state.jobs.filter(j => !j.match || j.match.score >= 50);
+  if (!state.jobs.length) { list.innerHTML = '<div class="empty-state">Search public feeds to load listings, or search the job sites above.</div>'; return; }
+  const minimumScore = Number($("score").value || state.profile.preferences?.minimum_match_score || 0);
+  const minimumSalary = Number($("minimum-salary").value || 0);
+  const preferredLocations = splitList($("locations").value).map(value => value.toLowerCase());
+  const excludedKeywords = splitList($("excluded-keywords").value).map(value => value.toLowerCase());
+  const remoteAllowed = $("remote-allowed").checked;
+  const matching = state.jobs.filter(j => {
+    if (j.match && j.match.score < minimumScore) return false;
+    if (minimumSalary > 0 && j.salary_min != null && Number(j.salary_min) < minimumSalary) return false;
+    const searchable = `${j.title || ""} ${j.company || ""} ${j.location || ""} ${j.description || ""}`.toLowerCase();
+    if (excludedKeywords.some(keyword => searchable.includes(keyword))) return false;
+    const location = String(j.location || "").toLowerCase();
+    const isRemote = String(j.remote_type || "").toUpperCase() === "REMOTE" || location.includes("remote") || location.includes("worldwide");
+    if (isRemote && !remoteAllowed) return false;
+    if (preferredLocations.length && !preferredLocations.some(place => location.includes(place)) && !(isRemote && remoteAllowed)) return false;
+    return true;
+  }).sort((a, b) => {
+    const aPosted = a.posted_at ? new Date(a.posted_at).getTime() : 0;
+    const bPosted = b.posted_at ? new Date(b.posted_at).getTime() : 0;
+    if (aPosted !== bPosted) return bPosted - aPosted;
+    return new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+  });
   const visible = state.showAllJobs ? matching : matching.slice(0, 6);
   $("view-jobs").textContent = state.showAllJobs ? "Top jobs ↑" : `All jobs (${matching.length}) →`;
   list.innerHTML = visible.map(j => {
@@ -103,6 +126,35 @@ function renderJobs() {
       await loadAll();
     } catch (err) { alert(err.message); }
   });
+}
+
+function splitList(value) { return String(value || "").split(",").map(item => item.trim()).filter(Boolean); }
+
+function renderPlatformSearchLinks() {
+  const box = $("platform-search-links");
+  if (!box) return;
+  const titles = splitList($("target-titles").value || (state.profile.professional?.target_job_titles || []).join(", "));
+  const locations = splitList($("locations").value || (state.profile.preferences?.preferred_locations || []).join(", "));
+  const title = titles[0] || "";
+  const location = locations[0] || "India";
+  const keyword = title;
+  const slug = value => String(value).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const indeed = new URL("https://in.indeed.com/jobs");
+  if (keyword) indeed.searchParams.set("q", keyword);
+  indeed.searchParams.set("l", location);
+  indeed.searchParams.set("sort", "date");
+  const linkedin = new URL("https://www.linkedin.com/jobs/search/");
+  if (keyword) linkedin.searchParams.set("keywords", keyword);
+  linkedin.searchParams.set("location", location);
+  linkedin.searchParams.set("sortBy", "DD");
+  const apna = new URL("https://apna.co/job-search");
+  if (title) apna.searchParams.set("query", title);
+  if (location) apna.searchParams.set("location", location);
+  const links = [
+    ["Naukri", `https://www.naukri.com/${slug(keyword) ? `${slug(keyword)}-jobs-in-` : "jobs-in-"}${slug(location.toLowerCase().includes("remote") ? "india" : location) || "india"}`],
+    ["Indeed", indeed.href], ["Apna", apna.href], ["LinkedIn", linkedin.href],
+  ];
+  box.innerHTML = links.map(([name, url]) => `<a class="platform-search-link" href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(name)} ↗</a>`).join("");
 }
 
 function renderApps() {
@@ -230,7 +282,10 @@ $("save-preferences").onclick = async () => {
     await loadAll();
   } catch (err) { showMessage("message", err.message, true); }
 };
-$("score").oninput = () => $("score-label").textContent = `${$("score").value}%`;
+$("score").oninput = () => { $("score-label").textContent = `${$("score").value}%`; renderJobs(); };
+$("minimum-salary").oninput = $("locations").oninput = $("excluded-keywords").oninput = () => renderJobs();
+$("remote-allowed").onchange = () => renderJobs();
+$("target-titles").oninput = () => renderPlatformSearchLinks();
 $("notice-resume").onclick = () => $("resume-panel").scrollIntoView({behavior: "smooth"});
 $("resume-file").onchange = async event => {
   const file = event.target.files[0]; if (!file) return;

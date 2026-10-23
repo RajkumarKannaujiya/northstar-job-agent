@@ -2,7 +2,7 @@
 
 Northstar is a modular job-search platform foundation. It includes an authenticated API, PostgreSQL schema, encrypted resume file storage, a local dashboard, resume parsing, job matching, deduplication, policy checks, application tracking, Celery worker services, and synthetic portal fixtures.
 
-The synthetic portal is kept for repeatable demos. The backend reads public Remote OK and Remotive remote-job feeds and published jobs from employer-configured Greenhouse and Lever boards. It matches listings to a user's resume locally and links back to the original source. Remotive's public feed updates on a 24-hour delay, and every Remotive listing must identify Remotive and link to its original post. Naukri, Indeed, LinkedIn, Apna, Foundit, Internshala, Wellfound, Cutshort, Shine, TimesJobs, and Glassdoor are manual link sources until an official, permitted integration is available.
+The synthetic portal is kept for repeatable demos. The backend reads public Remote OK and Remotive remote-job feeds and published jobs from employer-configured Greenhouse and Lever boards. It matches listings to a user's resume locally, filters and sorts them by posting date, and links back to the original source. Remotive's public feed updates on a 24-hour delay, and every Remotive listing must identify Remotive and link to its original post. Naukri, Indeed, LinkedIn, Apna, Foundit, Internshala, Wellfound, Cutshort, Shine, TimesJobs, and Glassdoor are filtered search links that open on each provider's site; the app does not import their private logged-in search results.
 
 ## Start locally with Docker
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import current_user
 from app.core.config import settings
@@ -450,7 +451,7 @@ def add_job(payload: JobInput, user: User = Depends(current_user), db: Session =
 @router.get("/jobs")
 def list_jobs(q: str | None = None, min_score: float | None = None, limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)):
     limit = max(1, min(limit, 200))
-    query = select(Job).order_by(desc(Job.posted_at), desc(Job.created_at)).limit(limit)
+    query = select(Job).order_by(desc(Job.posted_at).nulls_last(), desc(Job.created_at)).limit(limit)
     if q: query = query.where(Job.title.ilike(f"%{q}%") | Job.company.ilike(f"%{q}%") | Job.location.ilike(f"%{q}%"))
     jobs = db.scalars(query).all()
     result = []
@@ -469,10 +470,10 @@ def get_job(job_id: UUID, user: User = Depends(current_user), db: Session = Depe
     return _job_dict(job, db)
 
 
-def analyze_job(job: Job, user: User, db: Session) -> dict:
-    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+def analyze_job(job: Job, user: User, db: Session, *, resumes: list[Resume] | None = None, profile: dict | None = None) -> dict:
+    resumes = resumes if resumes is not None else db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
     if not resumes: raise HTTPException(400, "Upload a resume before analyzing jobs")
-    profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
+    profile = profile if profile is not None else _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
     match = db.scalar(select(JobMatch).where(JobMatch.user_id == user.id, JobMatch.job_id == job.id))
     override_resume = db.get(Resume, match.resume_id) if match and match.manual_resume_override and match.resume_id else None
     if override_resume and override_resume.user_id == user.id:
@@ -543,39 +544,24 @@ def discover_mock(user: User = Depends(current_user), db: Session = Depends(get_
     return {"count": len(discovered), "items": discovered}
 
 
-@router.post("/jobs/discover-live")
-async def discover_live_jobs(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Fetch attributed public remote-job feeds, rank them locally, and never submit applications."""
-    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
-    profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
-    feeds = ("remoteok", "remotive")
-    now = datetime.now(timezone.utc)
-    report: list[dict[str, Any]] = []
+def _persist_live_discovery(
+    user: User,
+    db: Session,
+    resumes: list[Resume],
+    profile: dict,
+    sources: dict[str, JobSource],
+    initial_report: list[dict[str, Any]],
+    fetched: dict[str, Any],
+    now: datetime,
+) -> dict[str, Any]:
+    """Keep synchronous SQLAlchemy work off the API event loop on the small free host."""
+    report = list(initial_report)
     total_seen = total_new = 0
-
-    for provider in feeds:
-        source = db.scalar(select(JobSource).where(JobSource.user_id == user.id, JobSource.platform == provider))
-        if not source:
-            source = JobSource(user_id=user.id, platform=provider, status="CONNECTED_READ_ONLY", automation_available=True)
-            db.add(source)
-            db.flush()
-
-        last_success = source.last_success_at
-        if last_success and last_success.tzinfo is None:
-            last_success = last_success.replace(tzinfo=timezone.utc)
-        # Remotive asks consumers to fetch at most four times a day; the same
-        # six-hour refresh window protects both feeds from repeated button clicks.
-        if last_success and now - last_success < timedelta(hours=6):
-            report.append({"provider": provider, "status": "cached", "new": 0})
+    for provider in ("remoteok", "remotive"):
+        if provider not in fetched:
             continue
-
-        try:
-            rows = await fetch_public_feed(
-                provider,
-                remoteok_fetcher=fetch_remoteok,
-                remotive_fetcher=fetch_remotive,
-            )
-        except Exception:
+        source, result = sources[provider], fetched[provider]
+        if isinstance(result, Exception):
             source.error_count = (source.error_count or 0) + 1
             source.last_error = "Public job feed request failed"
             source.status = "DEGRADED" if source.error_count >= 3 else "CONNECTED_READ_ONLY"
@@ -589,7 +575,7 @@ async def discover_live_jobs(user: User = Depends(current_user), db: Session = D
         source.last_error = None
         source.last_success_at = now
         provider_new = 0
-        for item in rows:
+        for item in result:
             existed = db.scalar(select(JobSourceMapping.id).where(
                 JobSourceMapping.platform == provider,
                 JobSourceMapping.platform_job_id == item["platform_job_id"],
@@ -599,17 +585,17 @@ async def discover_live_jobs(user: User = Depends(current_user), db: Session = D
             if not existed:
                 provider_new += 1
             if resumes:
-                analyze_job(job, user, db)
-        total_seen += len(rows)
+                analyze_job(job, user, db, resumes=resumes, profile=profile)
+        total_seen += len(result)
         total_new += provider_new
-        report.append({"provider": provider, "status": "ok", "count": len(rows), "new": provider_new})
+        report.append({"provider": provider, "status": "ok", "count": len(result), "new": provider_new})
 
     if total_new:
         db.add(Notification(
             user_id=user.id,
             kind="JOB_FOUND",
-            title="Live remote jobs found",
-            body=f"Added {total_new} new public listings from Remote OK and Remotive. Applications open on the source site.",
+            title="Public job listings found",
+            body=f"Added {total_new} new listings from Remote OK and Remotive. Review and apply on the source site.",
         ))
     increment("jobs_discovered_total", total_new)
     _audit(db, user.id, "LIVE_JOB_DISCOVERY_RUN", "job", detail={"new": total_new, "seen": total_seen})
@@ -622,6 +608,43 @@ async def discover_live_jobs(user: User = Depends(current_user), db: Session = D
         "resume_used_for_matching": bool(resumes),
         "resume_sent_to_feeds": False,
     }
+
+
+@router.post("/jobs/discover-live")
+async def discover_live_jobs(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Fetch attributed public remote-job feeds, rank them locally, and never submit applications."""
+    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+    profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
+    feeds = ("remoteok", "remotive")
+    now = datetime.now(timezone.utc)
+    report: list[dict[str, Any]] = []
+    sources: dict[str, JobSource] = {}
+    pending: list[str] = []
+
+    for provider in feeds:
+        source = db.scalar(select(JobSource).where(JobSource.user_id == user.id, JobSource.platform == provider))
+        if not source:
+            source = JobSource(user_id=user.id, platform=provider, status="CONNECTED_READ_ONLY", automation_available=True)
+            db.add(source)
+            db.flush()
+        sources[provider] = source
+        last_success = source.last_success_at
+        if last_success and last_success.tzinfo is None:
+            last_success = last_success.replace(tzinfo=timezone.utc)
+        if last_success and now - last_success < timedelta(hours=6):
+            report.append({"provider": provider, "status": "cached", "new": 0})
+        else:
+            pending.append(provider)
+
+    requests = [
+        fetch_public_feed(provider, remoteok_fetcher=fetch_remoteok, remotive_fetcher=fetch_remotive)
+        for provider in pending
+    ]
+    results = await asyncio.gather(*requests, return_exceptions=True)
+    fetched = dict(zip(pending, results))
+    return await run_in_threadpool(
+        _persist_live_discovery, user, db, resumes, profile, sources, report, fetched, now
+    )
 
 
 @router.post("/applications", status_code=201)
