@@ -2,7 +2,7 @@
 
 Northstar is a modular job-search platform foundation. It includes an authenticated API, PostgreSQL schema, encrypted resume file storage, a local dashboard, resume parsing, job matching, deduplication, policy checks, application tracking, Celery worker services, and synthetic portal fixtures.
 
-The synthetic portal is kept for repeatable demos. The backend also reads published jobs from employer-configured Greenhouse and Lever boards through their public job-board APIs. These are read-only integrations: applications open on the employer's site and must be completed there. Naukri, Indeed, LinkedIn, Apna, Foundit, Internshala, Wellfound, Cutshort, Shine, TimesJobs, and Glassdoor are manual link sources until an official, permitted integration is available.
+The synthetic portal is kept for repeatable demos. The backend reads public Remote OK and Remotive remote-job feeds and published jobs from employer-configured Greenhouse and Lever boards. It matches listings to a user's resume locally and links back to the original source. Remotive's public feed updates on a 24-hour delay, and every Remotive listing must identify Remotive and link to its original post. Naukri, Indeed, LinkedIn, Apna, Foundit, Internshala, Wellfound, Cutshort, Shine, TimesJobs, and Glassdoor are manual link sources until an official, permitted integration is available.
 
 ## Start locally with Docker
 
@@ -40,6 +40,7 @@ Without Docker, install `backend/requirements.txt`, set `ENVIRONMENT=development
 - Unknown application questions stay unanswered and become manual actions; job descriptions and forms are treated as untrusted input.
 - Application status can be recorded as `SUBMITTED` only with a supported confirmation signal and reference.
 - Connector protocol, registry, Playwright lifecycle/form inspection boundary, and synthetic mock portal.
+- Read-only Remote OK and Remotive feed discovery, normalization, matching, deduplication, and per-process shared refresh cache (Remote OK every 6 hours; Remotive daily).
 - Read-only Greenhouse and Lever company-board discovery, normalization, matching, deduplication, and 6-hour opt-in refresh through Celery Beat or the protected GitHub Actions scheduler.
 - Redis/Celery workers, structured JSON logs, audit events, user notifications, notification read state, account export/deletion, and Docker Compose services.
 - Encrypted resume storage on local persistent volumes or private S3-compatible object storage (including Cloudflare R2).
@@ -52,7 +53,7 @@ Implement `JobPlatformAdapter` in `backend/app/platforms/protocol.py`; register 
 
 Implement the `AIProvider` protocol in `backend/app/services/ai_provider.py` for a selected provider. The default `RuleBasedProvider` is offline and conservative. It does not fabricate cover letters or unsupported answers. Job descriptions and user-provided application forms are untrusted content and must never override system policy or verified user facts.
 
-Company-board discovery is read-only and limited to configured public Greenhouse and Lever boards. Refresh can run every six hours through Celery Beat in the full Compose stack, or through the protected GitHub Actions scheduler. Users must opt in, and no applications are submitted automatically. Other platforms remain manual link-out sources.
+Job discovery reads the public Remote OK and Remotive feeds and configured public Greenhouse and Lever boards. The protected GitHub Actions scheduler refreshes opted-in accounts about every six hours. Remotive's public feed is cached for a day to follow its published request guidance. Users must opt in to scheduled refresh; no applications are submitted automatically. LinkedIn, Naukri, Indeed, and other platforms remain manual link-out sources.
 
 ## Schema and migrations
 
@@ -77,7 +78,7 @@ GitHub Pages can publish the static dashboard in frontend/app; it cannot run thi
 
 After creating the repository, set its Pages build source to GitHub Actions in Settings > Pages. The workflow then deploys the frontend on pushes to main. Set the repository variable `NORTHSTAR_API_URL` to the deployed HTTPS API origin; the workflow injects it into `config.js` at build time.
 
-To connect the dashboard, deploy the API and its database/worker services separately, then set the API origin and `CORS_ORIGINS` to include the Pages URL. Do not put secrets in config.js. Until an API is configured, the page explains that sign-in is unavailable and disables the form. For periodic discovery without a continuously running Celery Beat service, configure `SCHEDULER_SHARED_SECRET` on the API and the matching GitHub Actions secret `NORTHSTAR_SCHEDULER_SECRET`. The scheduled workflow calls only the authenticated internal refresh endpoint; the user must opt in within the dashboard.
+To connect the dashboard, deploy the API and its database/storage separately, then set the API origin and `CORS_ORIGINS` to include the Pages URL. Do not put secrets in config.js. Until an API is configured, the page explains that sign-in is unavailable and disables the form. For periodic discovery without a continuously running Celery Beat service, configure `SCHEDULER_SHARED_SECRET` on the API and the matching GitHub Actions secret `NORTHSTAR_SCHEDULER_SECRET`. The scheduled workflow calls only the authenticated internal refresh endpoint; the user must opt in within the dashboard. Remotive requests are shared across users and cached for 24 hours, consistent with its [official API guidance](https://github.com/remotive-com/remote-jobs-api); the dashboard labels and links its listings as required.
 
 For a $0 hobby host that can run this existing full stack, see [`deploy/oracle/README.md`](deploy/oracle/README.md). It uses GitHub Pages for the dashboard and an Oracle Always Free VM for FastAPI, PostgreSQL, Redis, Celery, persistent encrypted resumes, and Caddy HTTPS. It requires the user to create the cloud account, DNS name, and secrets; free-tier capacity and uptime are not guaranteed.
 

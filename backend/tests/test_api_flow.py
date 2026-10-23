@@ -151,7 +151,79 @@ def test_company_career_boards_are_read_only_and_can_be_scheduled(client, monkey
     assert jobs[0]["sources"][0]["platform"] == "greenhouse"
 
 
+def test_live_discovery_imports_and_ranks_public_feeds_with_cooldown(client, tmp_path, monkeypatch):
+    from app.platforms.public_feeds import clear_public_feed_cache
+    clear_public_feed_cache()
+    token = register(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "storage_path", str(tmp_path))
+    monkeypatch.setattr(settings, "environment", "development")
+    uploaded = client.post(
+        "/api/resumes/upload",
+        headers=headers,
+        files={"file": ("candidate.txt", b"Candidate\nSKILLS\nExcel, SQL", "text/plain")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+
+    from app.api import routes
+    calls = {"remoteok": 0, "remotive": 0}
+
+    def listing(provider, job_id):
+        return {
+            "platform": provider,
+            "platform_job_id": job_id,
+            "title": "Data Analyst",
+            "company": f"{provider} Example",
+            "location": "Worldwide Remote",
+            "remote_type": "REMOTE",
+            "salary_min": None,
+            "salary_max": None,
+            "currency": None,
+            "experience_min": None,
+            "experience_max": None,
+            "skills": ["Excel", "SQL"],
+            "description": "Analyze reports using Excel and SQL.",
+            "requirements": [],
+            "benefits": [],
+            "employment_type": "FULL_TIME",
+            "posted_at": datetime.now(timezone.utc),
+            "application_url": f"https://{provider}.example/jobs/{job_id}",
+            "application_type": "MANUAL",
+            "recruiter": None,
+            "source_url": f"https://{provider}.example/jobs/{job_id}",
+        }
+
+    async def fetch_remoteok():
+        calls["remoteok"] += 1
+        return [listing("remoteok", "live-1")]
+
+    async def fetch_remotive():
+        calls["remotive"] += 1
+        return [listing("remotive", "live-2")]
+
+    monkeypatch.setattr(routes, "fetch_remoteok", fetch_remoteok)
+    monkeypatch.setattr(routes, "fetch_remotive", fetch_remotive)
+
+    response = client.post("/api/jobs/discover-live", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["count"] == 2
+    assert response.json()["new"] == 2
+    assert response.json()["resume_used_for_matching"] is True
+    assert response.json()["resume_sent_to_feeds"] is False
+    jobs = client.get("/api/jobs", headers=headers).json()
+    assert {source["platform"] for job in jobs for source in job["sources"]} == {"remoteok", "remotive"}
+    assert all(job["match"] and job["match"]["score"] > 0 for job in jobs)
+    assert client.get("/api/applications", headers=headers).json() == []
+
+    cached = client.post("/api/jobs/discover-live", headers=headers)
+    assert cached.status_code == 200
+    assert all(feed["status"] == "cached" for feed in cached.json()["feeds"])
+    assert calls == {"remoteok": 1, "remotive": 1}
+
+
 def test_scheduled_discovery_requires_secret_and_only_processes_opted_in_users(client, monkeypatch):
+    from app.platforms.public_feeds import clear_public_feed_cache
+    clear_public_feed_cache()
     token = register(client)
     headers = {"Authorization": f"Bearer {token}"}
     saved = client.put("/api/platforms/company-careers", headers=headers, json={"boards": [{"provider": "lever", "board_token": "sample-company", "company_name": "Sample Company"}]})
@@ -167,7 +239,13 @@ def test_scheduled_discovery_requires_secret_and_only_processes_opted_in_users(c
     from app.api import routes
     async def no_jobs(provider, board_token, company_name):
         return []
+
+    async def no_public_jobs():
+        return []
+
     monkeypatch.setattr(routes, "fetch_board", no_jobs)
+    monkeypatch.setattr(routes, "fetch_remoteok", no_public_jobs)
+    monkeypatch.setattr(routes, "fetch_remotive", no_public_jobs)
     response = client.post("/api/internal/scheduled-discovery", headers={"X-Scheduler-Secret": secret})
     assert response.status_code == 200, response.text
     assert response.json()["processed"] == 1

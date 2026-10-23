@@ -5,7 +5,7 @@ import zipfile
 import asyncio
 import hmac
 from difflib import SequenceMatcher
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import quote
 from uuid import UUID
@@ -28,6 +28,7 @@ from app.models import (Application, ApplicationAnswer, ApplicationEvent, Applic
                         PlatformAccount, Profile, Resume, ResumeSkill, ResumeVersion, Skill, User)
 from app.platforms.mock import MOCK_JOBS
 from app.platforms.career_pages import fetch_board, validate_board
+from app.platforms.public_feeds import fetch_public_feed, fetch_remotive, fetch_remoteok
 from app.services.decisions import decide_application
 from app.services.matching import canonical_job_key, normalize_text, score_job
 from app.services.questions import answer_from_verified_sources, classify_question
@@ -542,6 +543,87 @@ def discover_mock(user: User = Depends(current_user), db: Session = Depends(get_
     return {"count": len(discovered), "items": discovered}
 
 
+@router.post("/jobs/discover-live")
+async def discover_live_jobs(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Fetch attributed public remote-job feeds, rank them locally, and never submit applications."""
+    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+    profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
+    feeds = ("remoteok", "remotive")
+    now = datetime.now(timezone.utc)
+    report: list[dict[str, Any]] = []
+    total_seen = total_new = 0
+
+    for provider in feeds:
+        source = db.scalar(select(JobSource).where(JobSource.user_id == user.id, JobSource.platform == provider))
+        if not source:
+            source = JobSource(user_id=user.id, platform=provider, status="CONNECTED_READ_ONLY", automation_available=True)
+            db.add(source)
+            db.flush()
+
+        last_success = source.last_success_at
+        if last_success and last_success.tzinfo is None:
+            last_success = last_success.replace(tzinfo=timezone.utc)
+        # Remotive asks consumers to fetch at most four times a day; the same
+        # six-hour refresh window protects both feeds from repeated button clicks.
+        if last_success and now - last_success < timedelta(hours=6):
+            report.append({"provider": provider, "status": "cached", "new": 0})
+            continue
+
+        try:
+            rows = await fetch_public_feed(
+                provider,
+                remoteok_fetcher=fetch_remoteok,
+                remotive_fetcher=fetch_remotive,
+            )
+        except Exception:
+            source.error_count = (source.error_count or 0) + 1
+            source.last_error = "Public job feed request failed"
+            source.status = "DEGRADED" if source.error_count >= 3 else "CONNECTED_READ_ONLY"
+            report.append({"provider": provider, "status": "failed", "count": 0, "new": 0})
+            increment("connector_errors_total")
+            continue
+
+        source.status = "CONNECTED_READ_ONLY"
+        source.automation_available = True
+        source.error_count = 0
+        source.last_error = None
+        source.last_success_at = now
+        provider_new = 0
+        for item in rows:
+            existed = db.scalar(select(JobSourceMapping.id).where(
+                JobSourceMapping.platform == provider,
+                JobSourceMapping.platform_job_id == item["platform_job_id"],
+            )) is not None
+            job = ingest_job(item, user, db)
+            db.flush()
+            if not existed:
+                provider_new += 1
+            if resumes:
+                analyze_job(job, user, db)
+        total_seen += len(rows)
+        total_new += provider_new
+        report.append({"provider": provider, "status": "ok", "count": len(rows), "new": provider_new})
+
+    if total_new:
+        db.add(Notification(
+            user_id=user.id,
+            kind="JOB_FOUND",
+            title="Live remote jobs found",
+            body=f"Added {total_new} new public listings from Remote OK and Remotive. Applications open on the source site.",
+        ))
+    increment("jobs_discovered_total", total_new)
+    _audit(db, user.id, "LIVE_JOB_DISCOVERY_RUN", "job", detail={"new": total_new, "seen": total_seen})
+    db.commit()
+    return {
+        "count": total_seen,
+        "new": total_new,
+        "feeds": report,
+        "mode": "read_only_public_feeds",
+        "resume_used_for_matching": bool(resumes),
+        "resume_sent_to_feeds": False,
+    }
+
+
 @router.post("/applications", status_code=201)
 def create_application(job_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
     job = db.get(Job, job_id)
@@ -679,13 +761,19 @@ def confirm_submission(application_id: UUID, payload: ConfirmationInput, user: U
 
 @router.get("/platforms")
 def list_platforms(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    names = ["naukri", "indeed", "linkedin", "apna", "foundit", "internshala", "wellfound", "cutshort", "shine", "timesjobs", "glassdoor", "company_careers", "greenhouse", "lever"]
+    names = ["remoteok", "remotive", "naukri", "indeed", "linkedin", "apna", "foundit", "internshala", "wellfound", "cutshort", "shine", "timesjobs", "glassdoor", "company_careers", "greenhouse", "lever"]
     records = {x.platform: x for x in db.scalars(select(JobSource).where(JobSource.user_id == user.id)).all()}
     return [{
         "platform": name,
         "status": records[name].status if name in records else "DISCONNECTED",
         "automation_available": bool(records[name].automation_available) if name in records else False,
-        "supported_mode": "public job discovery; application stays on employer site" if name in {"greenhouse", "lever"} else "manual link-out; no official integration configured",
+        "supported_mode": (
+            "public remote-job feed; applications stay on the source site"
+            if name in {"remoteok", "remotive"}
+            else "public company-board discovery; applications stay on employer site"
+            if name in {"greenhouse", "lever"}
+            else "manual link-out; no official integration configured"
+        ),
     } for name in names]
 
 
@@ -783,7 +871,7 @@ async def run_scheduled_discovery(x_scheduler_secret: str | None = Header(defaul
     if not expected or not x_scheduler_secret or not hmac.compare_digest(expected, x_scheduler_secret):
         raise HTTPException(404, "Not found")
     profiles = db.scalars(select(Profile).order_by(Profile.updated_at.asc())).all()
-    active = [profile for profile in profiles if (profile.application_preferences or {}).get("automation_active") and (profile.preferences or {}).get("company_career_boards")]
+    active = [profile for profile in profiles if (profile.application_preferences or {}).get("automation_active")]
     report = []
     for profile in active[:20]:
         user = db.get(User, profile.user_id)
@@ -791,8 +879,14 @@ async def run_scheduled_discovery(x_scheduler_secret: str | None = Header(defaul
             continue
         profile.updated_at = datetime.now(timezone.utc)
         try:
-            result = await discover_company_careers(user=user, db=db)
-            report.append({"status": "ok", "new": result["new"], "seen": result["count"]})
+            live_result = await discover_live_jobs(user=user, db=db)
+            boards = (profile.preferences or {}).get("company_career_boards", [])
+            company_result = await discover_company_careers(user=user, db=db) if boards else {"new": 0, "count": 0}
+            report.append({
+                "status": "ok",
+                "new": live_result["new"] + company_result["new"],
+                "seen": live_result["count"] + company_result["count"],
+            })
         except Exception:
             db.rollback()
             logger.exception("scheduled_company_discovery_failed user_id=%s", user.id)
@@ -823,7 +917,7 @@ def disconnect_platform(platform: str, user: User = Depends(current_user), db: S
 def automation_status(user: User = Depends(current_user), db: Session = Depends(get_db)):
     profile = _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
     prefs = profile.get("application_preferences", {})
-    return {"active": bool(prefs.get("automation_active", False)), "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": bool(prefs.get("auto_apply_enabled", False)), "limits": prefs}
+    return {"active": bool(prefs.get("automation_active", False)), "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": bool(prefs.get("auto_apply_enabled", False)), "scheduler_configured": bool(settings.scheduler_shared_secret), "limits": prefs}
 
 
 def set_automation(active: bool, user: User, db: Session):
@@ -832,19 +926,15 @@ def set_automation(active: bool, user: User, db: Session):
         profile = Profile(user_id=user.id, application_preferences={})
         db.add(profile)
     prefs = dict(profile.application_preferences or {})
-    if active:
-        preferences = profile.preferences or {}
-        if not preferences.get("company_career_boards"):
-            raise HTTPException(409, "Add at least one Greenhouse or Lever company board before starting scheduled discovery")
     prefs["automation_active"] = active
     if active and prefs.get("mode") == "AUTO_APPLY":
         prefs["mode"] = "ASSISTED"  # No connector has been approved/configured for hands-free submission.
         prefs["auto_apply_enabled"] = False
     profile.application_preferences = prefs
-    db.add(AutomationTask(user_id=user.id, task_type="COMPANY_CAREER_DISCOVERY", status="SCHEDULED" if active else "CANCELLED", payload={"providers": ["greenhouse", "lever"], "read_only": True}))
+    db.add(AutomationTask(user_id=user.id, task_type="LIVE_JOB_DISCOVERY", status="SCHEDULED" if active else "CANCELLED", payload={"providers": ["remoteok", "remotive", "greenhouse", "lever"], "read_only": True}))
     _audit(db, user.id, "AUTOMATION_STARTED" if active else "AUTOMATION_STOPPED", "automation")
     db.commit()
-    return {"active": active, "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": prefs.get("auto_apply_enabled", False), "message": "Read-only company-board refresh is scheduled every six hours when the worker or scheduled trigger is deployed. Applications still require manual completion."}
+    return {"active": active, "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": prefs.get("auto_apply_enabled", False), "scheduler_configured": bool(settings.scheduler_shared_secret), "message": "Live public job discovery is enabled. GitHub scheduled runs refresh the public feeds and saved company boards about every six hours. Applications are never submitted automatically."}
 
 
 @router.post("/automation/start")

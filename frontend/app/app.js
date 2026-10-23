@@ -68,6 +68,10 @@ async function loadAll() {
     $("excluded-keywords").value = (profile.preferences?.excluded_keywords || []).join(", ");
     $("remote-allowed").checked = Boolean(profile.preferences?.remote_allowed);
     $("automation-state").textContent = automation.active ? "SCHEDULED" : "PAUSED";
+    $("automation-help").textContent = automation.scheduler_configured
+      ? "Opt in for scheduled discovery. Remote OK refreshes about every six hours; Remotive refreshes daily. Review and submit each application on its source site."
+      : "Search job feeds now. Scheduled refresh is not configured on the server yet, so use Search job feeds whenever you want an update.";
+    $("start-automation").disabled = !automation.scheduler_configured;
     renderJobs(); renderApps(); renderResumes(); renderPlatforms(); renderBoards(); renderNotifications();
   } catch (err) {
     showMessage("message", err.message, true);
@@ -77,11 +81,14 @@ async function loadAll() {
 
 function renderJobs() {
   const list = $("job-list");
-  if (!state.jobs.length) { list.innerHTML = '<div class="empty-state">No jobs yet. Add a company board or paste a job link.</div>'; return; }
+  if (!state.jobs.length) { list.innerHTML = '<div class="empty-state">Choose Search job feeds to find remote listings, or add a company board.</div>'; return; }
   const matching = state.jobs.filter(j => !j.match || j.match.score >= 50);
   const visible = state.showAllJobs ? matching : matching.slice(0, 6);
   $("view-jobs").textContent = state.showAllJobs ? "Top jobs ↑" : `All jobs (${matching.length}) →`;
-  list.innerHTML = visible.map(j => `<article class="job-card"><div><div class="job-title">${esc(j.title)}</div><div class="job-company">${esc(j.company)}</div><div class="job-meta"><span>⌖ ${esc(j.location || "Location not listed")}</span><span>◷ ${j.posted_at ? timeAgo(j.posted_at) : "Date unknown"}</span><span>${j.salary_min ? money(j.salary_min, j.currency) : "Salary undisclosed"}</span></div></div><div class="score">${j.match ? `${Math.round(j.match.score)}%` : "—"}</div><div class="job-actions"><a href="${safeUrl(j.application_url)}" target="_blank" rel="noreferrer">View job ↗</a><button data-analyze="${esc(j.id)}">Analyze fit</button><button data-apply="${esc(j.id)}">Track application</button></div></article>`).join("");
+  list.innerHTML = visible.map(j => {
+    const sourceNames = [...new Set((j.sources || []).map(source => ({remoteok: "Remote OK", remotive: "Remotive", greenhouse: "Greenhouse", lever: "Lever"}[source.platform] || source.platform)))];
+    return `<article class="job-card"><div><div class="job-title">${esc(j.title)}</div><div class="job-company">${esc(j.company)}${sourceNames.length ? ` · ${esc(sourceNames.join(", "))}` : ""}</div><div class="job-meta"><span>⌖ ${esc(j.location || "Location not listed")}</span><span>◷ ${j.posted_at ? timeAgo(j.posted_at) : "Date unknown"}</span><span>${j.salary_min ? money(j.salary_min, j.currency) : "Salary undisclosed"}</span></div></div><div class="score">${j.match ? `${Math.round(j.match.score)}%` : "—"}</div><div class="job-actions"><a href="${safeUrl(j.application_url)}" target="_blank" rel="noreferrer">View job ↗</a><button data-analyze="${esc(j.id)}">Analyze fit</button><button data-apply="${esc(j.id)}">Track application</button></div></article>`;
+  }).join("");
   list.querySelectorAll("[data-analyze]").forEach(button => button.onclick = async () => {
     try {
       const result = await api(`/jobs/${encodeURIComponent(button.dataset.analyze)}/analyze`, {method: "POST"});
@@ -145,7 +152,7 @@ function renderBoards() {
 
 function renderPlatforms() {
   const box = $("platform-list");
-  box.innerHTML = state.platforms.filter(item => !["greenhouse", "lever"].includes(item.platform)).map(item => `<div class="resume-row"><span class="resume-icon">◎</span><div><b>${esc(item.platform)}</b><small>${esc(item.status.replaceAll("_", " "))} · manual link mode</small></div><button data-source-platform="${esc(item.platform)}" data-source-status="${esc(item.status)}">${item.status === "DISCONNECTED" ? "Track" : "Remove"}</button></div>`).join("") || '<div class="empty-state">No manual platforms.</div>';
+  box.innerHTML = state.platforms.filter(item => !["greenhouse", "lever", "remoteok", "remotive"].includes(item.platform)).map(item => `<div class="resume-row"><span class="resume-icon">◎</span><div><b>${esc(item.platform)}</b><small>${esc(item.status.replaceAll("_", " "))} · manual link mode</small></div><button data-source-platform="${esc(item.platform)}" data-source-status="${esc(item.status)}">${item.status === "DISCONNECTED" ? "Track" : "Remove"}</button></div>`).join("") || '<div class="empty-state">Other platforms need official integrations; use their job links manually.</div>';
   box.querySelectorAll("[data-source-platform]").forEach(button => button.onclick = async () => {
     try {
       const name = button.dataset.sourcePlatform;
@@ -184,8 +191,18 @@ $("register").onclick = () => auth("register");
 $("signout").onclick = () => { sessionStorage.removeItem(tokenKey); setAuthenticated(false); };
 $("refresh").onclick = loadAll;
 $("discover").onclick = async () => {
-  try { await api("/jobs/discover-mock", {method: "POST"}); await loadAll(); showMessage("message", "Synthetic demo jobs discovered and ranked."); }
+  const button = $("discover");
+  button.disabled = true;
+  button.textContent = "Searching…";
+  try {
+    const result = await api("/jobs/discover-live", {method: "POST"});
+    await loadAll();
+    const sources = result.feeds.map(feed => `${feed.provider}: ${feed.status === "cached" ? "refreshed recently" : `${feed.status}${feed.count !== undefined ? `, ${feed.count} checked` : ""}`}${feed.new ? `, ${feed.new} new` : ""}`).join(" · ");
+    const checked = result.feeds.some(feed => feed.status === "ok") ? `${result.count} live listings checked; ` : "";
+    showMessage("message", `${checked}${result.new} new listings. ${sources}. Review and submit applications on the source site.`);
+  }
   catch (err) { showMessage("message", err.message, true); }
+  finally { button.disabled = false; button.textContent = "Search job feeds"; }
 };
 $("view-jobs").onclick = () => { state.showAllJobs = !state.showAllJobs; renderJobs(); };
 $("view-applications").onclick = () => { state.showAllApplications = !state.showAllApplications; renderApps(); };

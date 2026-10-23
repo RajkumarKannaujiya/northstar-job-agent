@@ -1,4 +1,4 @@
-name: Refresh opted-in company career boards
+name: Refresh opted-in public job feeds and company boards
 
 on:
   schedule:
