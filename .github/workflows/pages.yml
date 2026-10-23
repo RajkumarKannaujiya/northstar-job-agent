@@ -39,6 +39,10 @@ jobs:
           (app / "config.js").write_text(f'window.NORTHSTAR_API_URL = "{origin}";\n', encoding="utf-8")
           html_path = app / "index.html"
           html = html_path.read_text(encoding="utf-8")
+          html = html.replace(
+              'src="./config.js" defer',
+              f'src="./config.js?v={os.environ.get("GITHUB_SHA", "latest")}" defer',
+          )
           csp_origin = f" {origin}" if origin else ""
           html = re.sub(
               r"(<meta http-equiv=\"Content-Security-Policy\" content=\")(.*?)(\">)",
