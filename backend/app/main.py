@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
+from sqlalchemy import text
 
 from app.api.routes import router
 from app.core.config import settings
@@ -46,7 +47,13 @@ async def request_limit(request: Request, call_next):
         return JSONResponse(status_code=429, content={"detail": "Request rate limit exceeded"})
     bucket.append(now)
     increment("http_requests_total")
-    return await call_next(request)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 app.include_router(router, prefix="/api")
@@ -54,7 +61,18 @@ app.include_router(router, prefix="/api")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "environment": settings.environment, "automation": "manual_or_mock_only"}
+    return {"status": "ok", "environment": settings.environment, "automation": "read_only_company_career_discovery_and_manual_applications"}
+
+
+@app.get("/ready")
+def ready():
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("readiness_check_failed")
+        return JSONResponse(status_code=503, content={"status": "not_ready", "database": "unavailable"})
+    return {"status": "ready", "database": "ok"}
 
 
 @app.get("/metrics", response_class=PlainTextResponse, include_in_schema=False)

@@ -2,14 +2,17 @@ import logging
 import re
 import io
 import zipfile
+import asyncio
+import hmac
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Response, UploadFile
 from pydantic import BaseModel, EmailStr, Field, field_validator
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -19,10 +22,12 @@ from app.core.database import get_db
 from app.core.metrics import increment, observe_match_score
 from app.core.security import create_access_token, hash_password, verify_password
 from app.core.storage import delete_encrypted, read_encrypted, save_encrypted
-from app.models import (Application, ApplicationEvent, ApplicationQuestion, ApplicationStatus,
+from app.models import (Application, ApplicationAnswer, ApplicationEvent, ApplicationQuestion, ApplicationStatus,
+                        AutomationTask,
                         AuditLog, Job, JobMatch, JobSkill, JobSource, JobSourceMapping, Notification,
-                        Profile, Resume, ResumeSkill, ResumeVersion, Skill, User)
+                        PlatformAccount, Profile, Resume, ResumeSkill, ResumeVersion, Skill, User)
 from app.platforms.mock import MOCK_JOBS
+from app.platforms.career_pages import fetch_board, validate_board
 from app.services.decisions import decide_application
 from app.services.matching import canonical_job_key, normalize_text, score_job
 from app.services.questions import answer_from_verified_sources, classify_question
@@ -102,6 +107,33 @@ class FailureInput(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class NotificationReadInput(BaseModel):
+    read: bool = True
+
+
+class CareerBoardInput(BaseModel):
+    provider: Literal["greenhouse", "lever"]
+    board_token: str = Field(min_length=1, max_length=120, pattern=r"^[A-Za-z0-9_-]+$")
+    company_name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("board_token", mode="before")
+    @classmethod
+    def strip_board_token(cls, value: str) -> str:
+        return str(value).strip()
+
+
+class CareerBoardsInput(BaseModel):
+    boards: list[CareerBoardInput] = Field(default_factory=list, max_length=10)
+
+    @field_validator("boards")
+    @classmethod
+    def no_duplicate_boards(cls, boards: list[CareerBoardInput]) -> list[CareerBoardInput]:
+        keys = [(board.provider, board.board_token.casefold()) for board in boards]
+        if len(keys) != len(set(keys)):
+            raise ValueError("A career board can be added only once")
+        return boards
+
+
 def _profile_dict(profile: Profile | None) -> dict:
     if not profile:
         return {}
@@ -177,6 +209,72 @@ def me(user: User = Depends(current_user)):
     return {"id": str(user.id), "email": user.email, "created_at": user.created_at}
 
 
+@router.get("/me/export")
+def export_account_data(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id).order_by(Resume.created_at)).all()
+    applications = db.scalars(select(Application).where(Application.user_id == user.id).order_by(Application.created_at)).all()
+    application_ids = [item.id for item in applications]
+    events = db.scalars(select(ApplicationEvent).where(ApplicationEvent.application_id.in_(application_ids))).all() if application_ids else []
+    questions = db.scalars(select(ApplicationQuestion).where(ApplicationQuestion.application_id.in_(application_ids))).all() if application_ids else []
+    notification_rows = db.scalars(select(Notification).where(Notification.user_id == user.id).order_by(Notification.created_at)).all()
+    return {
+        "exported_at": datetime.now(timezone.utc),
+        "account": {"id": str(user.id), "email": user.email, "created_at": user.created_at},
+        "profile": _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id))),
+        "resumes": [_resume_out(item) for item in resumes],
+        "applications": [
+            {
+                **_application_out(item, db.get(Job, item.job_id)),
+                "events": [
+                    {"type": event.event_type, "detail": event.detail, "occurred_at": event.occurred_at}
+                    for event in events if event.application_id == item.id
+                ],
+                "questions": [
+                    {"question": question.question, "classification": question.classification,
+                     "answer": question.answer, "confidence": question.confidence,
+                     "answer_source": question.answer_source, "requires_user_input": question.requires_user_input}
+                    for question in questions if question.application_id == item.id
+                ],
+            }
+            for item in applications
+        ],
+        "notifications": [
+            {"kind": item.kind, "title": item.title, "body": item.body, "link": item.link,
+             "read": item.read, "created_at": item.created_at}
+            for item in notification_rows
+        ],
+    }
+
+
+@router.delete("/me", status_code=204)
+def delete_account(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    resume_rows = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+    resume_ids = [item.id for item in resume_rows]
+    application_ids = select(Application.id).where(Application.user_id == user.id)
+    if resume_ids:
+        db.execute(delete(ResumeVersion).where(ResumeVersion.resume_id.in_(resume_ids)))
+        db.execute(delete(ResumeSkill).where(ResumeSkill.resume_id.in_(resume_ids)))
+    db.execute(delete(ApplicationQuestion).where(ApplicationQuestion.application_id.in_(application_ids)))
+    db.execute(delete(ApplicationEvent).where(ApplicationEvent.application_id.in_(application_ids)))
+    db.execute(delete(Application).where(Application.user_id == user.id))
+    for model in (ApplicationAnswer, JobMatch, JobSource, PlatformAccount, AutomationTask, Notification, AuditLog):
+        db.execute(delete(model).where(model.user_id == user.id))
+    db.execute(delete(Resume).where(Resume.user_id == user.id))
+    db.execute(delete(Profile).where(Profile.user_id == user.id))
+    db.delete(user)
+    db.commit()
+    cleanup_failed = []
+    for resume in resume_rows:
+        try:
+            delete_encrypted(resume.storage_key)
+        except Exception:
+            logger.exception("resume_storage_cleanup_failed")
+            cleanup_failed.append(resume.storage_key)
+    if cleanup_failed:
+        logger.error("encrypted_resume_cleanup_pending count=%d", len(cleanup_failed))
+    return Response(status_code=204)
+
+
 @router.get("/profile")
 def get_profile(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return _profile_dict(db.scalar(select(Profile).where(Profile.user_id == user.id)))
@@ -208,12 +306,40 @@ async def upload_resume(file: UploadFile = File(...), user: User = Depends(curre
     try:
         extracted = extract_text(filename, content)
     except Exception as exc:
-        raise HTTPException(422, f"Resume parsing failed: {exc}") from exc
+        logger.exception("resume_extraction_failed filename=%s", filename)
+        raise HTTPException(422, "Resume extraction failed. Check the file format and try again.") from exc
     parsed = parse_resume(extracted)
     key = save_encrypted(content, "." + suffix)
     resume = Resume(user_id=user.id, filename=filename, content_type=file.content_type or "application/octet-stream", storage_key=key, parsed_data=parsed, extracted_text=extracted)
     db.add(resume)
     try:
+        existing_resumes = db.scalar(select(Resume.id).where(Resume.user_id == user.id).limit(1))
+        if not existing_resumes:
+            resume.is_preferred = True
+        profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
+        if not profile:
+            profile = Profile(user_id=user.id)
+            db.add(profile)
+        personal = dict(profile.personal or {})
+        for field in ("full_name", "email", "phone", "location"):
+            parsed_field = "name" if field == "full_name" else field
+            if parsed.get(parsed_field) and not personal.get(field):
+                personal[field] = parsed[parsed_field]
+        professional = dict(profile.professional or {})
+        if parsed.get("explicit_skills") and not professional.get("skills"):
+            professional["skills"] = parsed["explicit_skills"]
+        if parsed.get("job_titles") and not professional.get("resume_job_titles"):
+            professional["resume_job_titles"] = parsed["job_titles"]
+        if parsed.get("years_of_experience") and not professional.get("total_experience"):
+            professional["total_experience"] = parsed["years_of_experience"]
+        education = dict(profile.education or {})
+        if parsed.get("degree") and not education.get("degree"):
+            education["degree"] = parsed["degree"]
+        if parsed.get("graduation_year") and not education.get("graduation_year"):
+            education["graduation_year"] = parsed["graduation_year"]
+        profile.personal = personal
+        profile.professional = professional
+        profile.education = education
         db.flush()
         db.add(ResumeVersion(resume_id=resume.id, version=1, filename=filename, storage_key=key, parsed_data=parsed))
         for name in parsed.get("explicit_skills", []):
@@ -235,6 +361,35 @@ def _resume_out(resume: Resume) -> dict:
 @router.get("/resumes")
 def list_resumes(user: User = Depends(current_user), db: Session = Depends(get_db)):
     return [_resume_out(x) for x in db.scalars(select(Resume).where(Resume.user_id == user.id).order_by(desc(Resume.created_at))).all()]
+
+
+@router.get("/resumes/{resume_id}/download")
+def download_resume(resume_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    resume = db.scalar(select(Resume).where(Resume.id == resume_id, Resume.user_id == user.id))
+    if not resume:
+        raise HTTPException(404, "Resume not found")
+    try:
+        content = read_encrypted(resume.storage_key)
+    except Exception as exc:
+        logger.exception("resume_download_failed resume_id=%s", resume_id)
+        raise HTTPException(503, "Resume storage is temporarily unavailable") from exc
+    suffix = resume.filename.rsplit(".", 1)[-1].lower()
+    media_type = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "txt": "text/plain"}.get(suffix, "application/octet-stream")
+    filename = quote(resume.filename.replace("\r", "").replace("\n", ""), safe="")
+    return Response(content=content, media_type=media_type, headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}", "Cache-Control": "no-store"})
+
+
+@router.put("/resumes/{resume_id}/preferred")
+def set_preferred_resume(resume_id: UUID, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    resumes = db.scalars(select(Resume).where(Resume.user_id == user.id)).all()
+    target = next((item for item in resumes if item.id == resume_id), None)
+    if not target:
+        raise HTTPException(404, "Resume not found")
+    for item in resumes:
+        item.is_preferred = item.id == resume_id
+    _audit(db, user.id, "PREFERRED_RESUME_CHANGED", "resume", str(resume_id))
+    db.commit()
+    return _resume_out(target)
 
 
 @router.delete("/resumes/{resume_id}", status_code=204)
@@ -524,9 +679,125 @@ def confirm_submission(application_id: UUID, payload: ConfirmationInput, user: U
 
 @router.get("/platforms")
 def list_platforms(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    names = ["naukri", "indeed", "linkedin", "apna", "foundit", "internshala", "wellfound", "cutshort", "shine", "timesjobs", "glassdoor", "company_careers"]
+    names = ["naukri", "indeed", "linkedin", "apna", "foundit", "internshala", "wellfound", "cutshort", "shine", "timesjobs", "glassdoor", "company_careers", "greenhouse", "lever"]
     records = {x.platform: x for x in db.scalars(select(JobSource).where(JobSource.user_id == user.id)).all()}
-    return [{"platform": name, "status": records[name].status if name in records else "DISCONNECTED", "automation_available": False, "supported_mode": "manual link-out until permitted official integration is configured"} for name in names]
+    return [{
+        "platform": name,
+        "status": records[name].status if name in records else "DISCONNECTED",
+        "automation_available": bool(records[name].automation_available) if name in records else False,
+        "supported_mode": "public job discovery; application stays on employer site" if name in {"greenhouse", "lever"} else "manual link-out; no official integration configured",
+    } for name in names]
+
+
+@router.get("/platforms/company-careers")
+def list_company_career_boards(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    return {"boards": (profile.preferences or {}).get("company_career_boards", []) if profile else []}
+
+
+@router.put("/platforms/company-careers")
+def save_company_career_boards(payload: CareerBoardsInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    if not profile:
+        profile = Profile(user_id=user.id)
+        db.add(profile)
+    preferences = dict(profile.preferences or {})
+    preferences["company_career_boards"] = [board.model_dump() for board in payload.boards]
+    profile.preferences = preferences
+    configured = {(board.provider, board.board_token) for board in payload.boards}
+    for provider in ("greenhouse", "lever"):
+        source = db.scalar(select(JobSource).where(JobSource.user_id == user.id, JobSource.platform == provider))
+        provider_configured = any(item[0] == provider for item in configured)
+        if provider_configured and not source:
+            db.add(JobSource(user_id=user.id, platform=provider, status="CONNECTED_READ_ONLY", automation_available=True))
+        elif source and not provider_configured:
+            source.status = "DISCONNECTED"
+            source.automation_available = False
+    _audit(db, user.id, "COMPANY_CAREER_BOARDS_UPDATED", "profile", str(profile.id), {"count": len(payload.boards)})
+    db.commit()
+    return {"boards": preferences["company_career_boards"], "message": "Only published jobs are read; application submission remains manual."}
+
+
+@router.post("/jobs/discover-company-careers")
+async def discover_company_careers(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    profile = db.scalar(select(Profile).where(Profile.user_id == user.id))
+    boards = (profile.preferences or {}).get("company_career_boards", []) if profile else []
+    if not boards:
+        raise HTTPException(409, "Add a Greenhouse or Lever company board before discovery")
+
+    semaphore = asyncio.Semaphore(3)
+
+    async def load_board(board: dict[str, Any]):
+        async with semaphore:
+            return await fetch_board(board["provider"], board["board_token"], board.get("company_name", board["board_token"]))
+
+    fetched = await asyncio.gather(*(load_board(board) for board in boards), return_exceptions=True)
+    resume_exists = db.scalar(select(Resume.id).where(Resume.user_id == user.id)) is not None
+    total_new = 0
+    total_seen = 0
+    report = []
+    for board, result in zip(boards, fetched):
+        provider = board["provider"]
+        source = db.scalar(select(JobSource).where(JobSource.user_id == user.id, JobSource.platform == provider))
+        if not source:
+            source = JobSource(user_id=user.id, platform=provider, status="CONNECTED_READ_ONLY", automation_available=True)
+            db.add(source)
+        if isinstance(result, Exception):
+            source.error_count = (source.error_count or 0) + 1
+            source.last_error = "Public career board request failed"
+            source.status = "DEGRADED" if source.error_count >= 3 else "CONNECTED_READ_ONLY"
+            report.append({"provider": provider, "board_token": board["board_token"], "status": "failed", "count": 0})
+            increment("connector_errors_total")
+            continue
+
+        source.status = "CONNECTED_READ_ONLY"
+        source.automation_available = True
+        source.error_count = 0
+        source.last_error = None
+        source.last_success_at = datetime.now(timezone.utc)
+        board_new = 0
+        for item in result:
+            mapped_id = item["platform_job_id"]
+            existing = db.scalar(select(JobSourceMapping.id).where(JobSourceMapping.platform == provider, JobSourceMapping.platform_job_id == mapped_id))
+            job = ingest_job(item, user, db)
+            db.flush()
+            if existing is None:
+                board_new += 1
+            if resume_exists:
+                analyze_job(job, user, db)
+        total_new += board_new
+        total_seen += len(result)
+        report.append({"provider": provider, "board_token": board["board_token"], "status": "ok", "count": len(result), "new": board_new})
+
+    if total_new:
+        db.add(Notification(user_id=user.id, kind="JOB_FOUND", title="New company career jobs found", body=f"Found {total_new} new published jobs across your saved boards."))
+    increment("jobs_discovered_total", total_new)
+    _audit(db, user.id, "COMPANY_CAREER_DISCOVERY_RUN", "job", detail={"new": total_new, "seen": total_seen})
+    db.commit()
+    return {"count": total_seen, "new": total_new, "boards": report, "mode": "read_only_public_jobs"}
+
+
+@router.post("/internal/scheduled-discovery", include_in_schema=False)
+async def run_scheduled_discovery(x_scheduler_secret: str | None = Header(default=None), db: Session = Depends(get_db)):
+    expected = settings.scheduler_shared_secret
+    if not expected or not x_scheduler_secret or not hmac.compare_digest(expected, x_scheduler_secret):
+        raise HTTPException(404, "Not found")
+    profiles = db.scalars(select(Profile).order_by(Profile.updated_at.asc())).all()
+    active = [profile for profile in profiles if (profile.application_preferences or {}).get("automation_active") and (profile.preferences or {}).get("company_career_boards")]
+    report = []
+    for profile in active[:20]:
+        user = db.get(User, profile.user_id)
+        if not user:
+            continue
+        profile.updated_at = datetime.now(timezone.utc)
+        try:
+            result = await discover_company_careers(user=user, db=db)
+            report.append({"status": "ok", "new": result["new"], "seen": result["count"]})
+        except Exception:
+            db.rollback()
+            logger.exception("scheduled_company_discovery_failed user_id=%s", user.id)
+            report.append({"status": "failed"})
+    return {"processed": len(report), "users": report}
 
 
 @router.post("/platforms/connect")
@@ -561,15 +832,19 @@ def set_automation(active: bool, user: User, db: Session):
         profile = Profile(user_id=user.id, application_preferences={})
         db.add(profile)
     prefs = dict(profile.application_preferences or {})
+    if active:
+        preferences = profile.preferences or {}
+        if not preferences.get("company_career_boards"):
+            raise HTTPException(409, "Add at least one Greenhouse or Lever company board before starting scheduled discovery")
     prefs["automation_active"] = active
     if active and prefs.get("mode") == "AUTO_APPLY":
         prefs["mode"] = "ASSISTED"  # No connector has been approved/configured for hands-free submission.
         prefs["auto_apply_enabled"] = False
     profile.application_preferences = prefs
-    db.add(AutomationTask(user_id=user.id, task_type="JOB_DISCOVERY", status="QUEUED" if active else "CANCELLED", payload={"manual_connector_required": True}))
+    db.add(AutomationTask(user_id=user.id, task_type="COMPANY_CAREER_DISCOVERY", status="SCHEDULED" if active else "CANCELLED", payload={"providers": ["greenhouse", "lever"], "read_only": True}))
     _audit(db, user.id, "AUTOMATION_STARTED" if active else "AUTOMATION_STOPPED", "automation")
     db.commit()
-    return {"active": active, "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": prefs.get("auto_apply_enabled", False), "message": "Discovery controls are saved; platform discovery workers require an approved source integration."}
+    return {"active": active, "mode": prefs.get("mode", "ASSISTED"), "auto_apply_enabled": prefs.get("auto_apply_enabled", False), "message": "Read-only company-board refresh is scheduled every six hours when the worker or scheduled trigger is deployed. Applications still require manual completion."}
 
 
 @router.post("/automation/start")
@@ -603,6 +878,25 @@ def patch_preferences(payload: dict, user: User = Depends(current_user), db: Ses
 def notifications(user: User = Depends(current_user), db: Session = Depends(get_db)):
     rows = db.scalars(select(Notification).where(Notification.user_id == user.id).order_by(desc(Notification.created_at)).limit(100)).all()
     return [{"id": str(x.id), "kind": x.kind, "title": x.title, "body": x.body, "link": x.link, "read": x.read, "created_at": x.created_at} for x in rows]
+
+
+@router.patch("/notifications/{notification_id}")
+def update_notification(notification_id: UUID, payload: NotificationReadInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.scalar(select(Notification).where(Notification.id == notification_id, Notification.user_id == user.id))
+    if not row:
+        raise HTTPException(404, "Notification not found")
+    row.read = payload.read
+    db.commit()
+    return {"id": str(row.id), "read": row.read}
+
+
+@router.post("/notifications/read-all")
+def mark_all_notifications_read(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Notification).where(Notification.user_id == user.id, Notification.read.is_(False))).all()
+    for row in rows:
+        row.read = True
+    db.commit()
+    return {"updated": len(rows)}
 
 
 @router.get("/dashboard")

@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from cryptography.fernet import Fernet
@@ -23,11 +24,15 @@ def _fernet() -> Fernet:
 
 
 def save_encrypted(content: bytes, suffix: str) -> str:
+    file_id = f"{uuid4().hex}{suffix}.enc"
+    encrypted = _fernet().encrypt(content)
+    if settings.storage_backend == "s3":
+        _s3_client().put_object(Bucket=settings.s3_bucket, Key=file_id, Body=encrypted)
+        return file_id
     root = Path(settings.storage_path).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    file_id = f"{uuid4().hex}{suffix}.enc"
     destination = root / file_id
-    destination.write_bytes(_fernet().encrypt(content))
+    destination.write_bytes(encrypted)
     try:
         os.chmod(destination, 0o600)
     except OSError:
@@ -36,6 +41,10 @@ def save_encrypted(content: bytes, suffix: str) -> str:
 
 
 def read_encrypted(file_id: str) -> bytes:
+    _validate_file_id(file_id)
+    if settings.storage_backend == "s3":
+        response = _s3_client().get_object(Bucket=settings.s3_bucket, Key=file_id)
+        return _fernet().decrypt(response["Body"].read())
     root = Path(settings.storage_path).resolve()
     path = (root / file_id).resolve()
     if path.parent != root:
@@ -44,7 +53,30 @@ def read_encrypted(file_id: str) -> bytes:
 
 
 def delete_encrypted(file_id: str) -> None:
+    _validate_file_id(file_id)
+    if settings.storage_backend == "s3":
+        _s3_client().delete_object(Bucket=settings.s3_bucket, Key=file_id)
+        return
     root = Path(settings.storage_path).resolve()
     path = (root / file_id).resolve()
     if path.parent == root and path.exists():
         path.unlink()
+
+
+def _validate_file_id(file_id: str) -> None:
+    if not re.fullmatch(r"[a-f0-9]{32}\.[a-z0-9]{1,8}\.enc", file_id or ""):
+        raise ValueError("Invalid storage key")
+
+
+def _s3_client():
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("Install the optional boto3 dependency to use S3 storage") from exc
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.s3_endpoint_url,
+        region_name=settings.s3_region,
+        aws_access_key_id=settings.s3_access_key_id,
+        aws_secret_access_key=settings.s3_secret_access_key,
+    )

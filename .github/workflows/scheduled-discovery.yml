@@ -1,0 +1,56 @@
+name: Refresh opted-in company career boards
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the protected discovery endpoint
+        env:
+          NORTHSTAR_API_URL: ${{ vars.NORTHSTAR_API_URL }}
+          NORTHSTAR_SCHEDULER_SECRET: ${{ secrets.NORTHSTAR_SCHEDULER_SECRET }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          base = os.environ.get("NORTHSTAR_API_URL", "").rstrip("/")
+          secret = os.environ.get("NORTHSTAR_SCHEDULER_SECRET", "")
+          if not base or not secret:
+              print("Skipped: set NORTHSTAR_API_URL and NORTHSTAR_SCHEDULER_SECRET to enable scheduled discovery.")
+              sys.exit(0)
+          if not base.startswith("https://"):
+              print("NORTHSTAR_API_URL must use HTTPS.")
+              sys.exit(1)
+
+          request = Request(
+              base + "/api/internal/scheduled-discovery",
+              method="POST",
+              headers={"X-Scheduler-Secret": secret, "Accept": "application/json"},
+          )
+          for attempt in range(4):
+              try:
+                  with urlopen(request, timeout=100) as response:
+                      print(json.dumps(json.loads(response.read().decode("utf-8"))))
+                  break
+              except HTTPError as error:
+                  if error.code < 500 and error.code != 429 or attempt == 3:
+                      print(f"Scheduled discovery failed with HTTP {error.code}.")
+                      sys.exit(1)
+              except (TimeoutError, URLError) as error:
+                  if attempt == 3:
+                      print(f"Scheduled discovery could not reach the API: {type(error).__name__}.")
+                      sys.exit(1)
+              time.sleep(10 * (attempt + 1))
+          PY

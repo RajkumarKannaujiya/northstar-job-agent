@@ -23,6 +23,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+      - name: Configure public API origin
+        env:
+          NORTHSTAR_API_URL: ${{ vars.NORTHSTAR_API_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          origin = os.environ.get("NORTHSTAR_API_URL", "").strip().rstrip("/")
+          if origin and not re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?", origin):
+              raise SystemExit("NORTHSTAR_API_URL must be an HTTPS origin without a path.")
+          app = Path("frontend/app")
+          (app / "config.js").write_text(f'window.NORTHSTAR_API_URL = "{origin}";\n', encoding="utf-8")
+          html_path = app / "index.html"
+          html = html_path.read_text(encoding="utf-8")
+          csp_origin = f" {origin}" if origin else ""
+          html = re.sub(
+              r"(<meta http-equiv=\"Content-Security-Policy\" content=\")(.*?)(\">)",
+              lambda match: match.group(1) + re.sub(r"connect-src [^;]+", "connect-src 'self'" + csp_origin, match.group(2)) + match.group(3),
+              html,
+              count=1,
+          )
+          html_path.write_text(html, encoding="utf-8")
+          PY
       - uses: actions/upload-pages-artifact@v3
         with:
           path: frontend/app

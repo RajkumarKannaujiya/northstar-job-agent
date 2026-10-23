@@ -70,6 +70,17 @@ def test_resume_upload_is_encrypted_and_versioned(client, tmp_path, monkeypatch)
     assert len(stored) == 1
     assert b"mira@example.com" not in stored[0].read_bytes()
     assert "python" in resume["parsed_data"]["explicit_skills"]
+    extracted_profile = client.get("/api/profile", headers=headers).json()
+    assert extracted_profile["personal"]["full_name"] == "Mira Shah"
+    assert extracted_profile["personal"]["email"] == "mira@example.com"
+    assert "python" in extracted_profile["professional"]["skills"]
+    assert resume["is_preferred"] is True
+    download = client.get(f"/api/resumes/{resume['id']}/download", headers=headers)
+    assert download.status_code == 200
+    assert download.content == b"Mira Shah\nmira@example.com\nSKILLS\nPython, SQL"
+    preferred = client.put(f"/api/resumes/{resume['id']}/preferred", headers=headers)
+    assert preferred.status_code == 200
+    assert preferred.json()["is_preferred"] is True
     with TestSession() as db:
         from app.models import ResumeVersion, ResumeSkill
         assert db.query(ResumeVersion).filter_by(resume_id=UUID(resume["id"])).count() == 1
@@ -77,3 +88,91 @@ def test_resume_upload_is_encrypted_and_versioned(client, tmp_path, monkeypatch)
     deleted = client.delete(f"/api/resumes/{resume['id']}", headers=headers)
     assert deleted.status_code == 204
     assert not list(tmp_path.glob("*.enc"))
+
+
+def test_account_export_notification_read_and_deletion(client, tmp_path, monkeypatch):
+    token = register(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "storage_path", str(tmp_path))
+    monkeypatch.setattr(settings, "environment", "development")
+    uploaded = client.post("/api/resumes/upload", headers=headers, files={"file": ("candidate.txt", b"Candidate\ncandidate@example.com\nSKILLS\nPython", "text/plain")})
+    assert uploaded.status_code == 201, uploaded.text
+    assert client.put("/api/profile", headers=headers, json={"personal": {"full_name": "Candidate"}}).status_code == 200
+    assert client.post("/api/jobs/discover-mock", headers=headers).status_code == 200
+
+    notice = client.get("/api/notifications", headers=headers).json()[0]
+    marked = client.patch(f"/api/notifications/{notice['id']}", headers=headers, json={"read": True})
+    assert marked.status_code == 200 and marked.json()["read"] is True
+    assert client.post("/api/notifications/read-all", headers=headers).status_code == 200
+
+    exported = client.get("/api/me/export", headers=headers)
+    assert exported.status_code == 200
+    assert exported.json()["account"]["email"] == "candidate@example.com"
+    assert len(exported.json()["resumes"]) == 1
+    assert exported.json()["profile"]["personal"]["full_name"] == "Candidate"
+
+    erased = client.delete("/api/me", headers=headers)
+    assert erased.status_code == 204
+    assert not list(tmp_path.glob("*.enc"))
+    assert client.get("/api/me", headers=headers).status_code == 401
+    with TestSession() as db:
+        from app.models import User, Profile, Resume, Notification, AuditLog
+        assert db.query(User).filter_by(email="candidate@example.com").count() == 0
+        assert db.query(Profile).count() == 0
+        assert db.query(Resume).count() == 0
+        assert db.query(Notification).count() == 0
+        assert db.query(AuditLog).count() == 0
+
+
+def test_company_career_boards_are_read_only_and_can_be_scheduled(client, monkeypatch):
+    token = register(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {"boards": [{"provider": "greenhouse", "board_token": "sample-company", "company_name": "Sample Company"}]}
+    saved = client.put("/api/platforms/company-careers", headers=headers, json=payload)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["boards"] == payload["boards"]
+
+    from app.api import routes
+    async def fake_fetch(provider, board_token, company_name):
+        return [{"platform": provider, "platform_job_id": f"{board_token}:100", "title": "Data Analyst", "company": company_name, "location": "Surat", "remote_type": "UNKNOWN", "salary_min": None, "salary_max": None, "currency": None, "experience_min": None, "experience_max": None, "skills": ["SQL"], "description": "SQL reporting", "requirements": [], "benefits": [], "employment_type": "UNKNOWN", "posted_at": datetime.now(timezone.utc), "application_url": "https://boards.greenhouse.io/sample-company/jobs/100", "application_type": "MANUAL", "recruiter": None, "source_url": "https://boards.greenhouse.io/sample-company/jobs/100"}]
+    monkeypatch.setattr(routes, "fetch_board", fake_fetch)
+
+    discovered = client.post("/api/jobs/discover-company-careers", headers=headers)
+    assert discovered.status_code == 200, discovered.text
+    assert discovered.json()["new"] == 1
+    assert discovered.json()["mode"] == "read_only_public_jobs"
+    assert client.get("/api/platforms", headers=headers).json()[-2]["automation_available"] is True
+    start = client.post("/api/automation/start", headers=headers)
+    assert start.status_code == 200, start.text
+    assert start.json()["active"] is True
+
+    jobs = client.get("/api/jobs", headers=headers).json()
+    assert jobs[0]["application_type"] == "MANUAL"
+    assert jobs[0]["sources"][0]["platform"] == "greenhouse"
+
+
+def test_scheduled_discovery_requires_secret_and_only_processes_opted_in_users(client, monkeypatch):
+    token = register(client)
+    headers = {"Authorization": f"Bearer {token}"}
+    saved = client.put("/api/platforms/company-careers", headers=headers, json={"boards": [{"provider": "lever", "board_token": "sample-company", "company_name": "Sample Company"}]})
+    assert saved.status_code == 200
+    started = client.post("/api/automation/start", headers=headers)
+    assert started.status_code == 200 and started.json()["active"] is True
+
+    secret = "test-only-scheduler-secret-32-chars-long"
+    monkeypatch.setattr(settings, "scheduler_shared_secret", secret)
+    unauthorized = client.post("/api/internal/scheduled-discovery")
+    assert unauthorized.status_code == 404
+
+    from app.api import routes
+    async def no_jobs(provider, board_token, company_name):
+        return []
+    monkeypatch.setattr(routes, "fetch_board", no_jobs)
+    response = client.post("/api/internal/scheduled-discovery", headers={"X-Scheduler-Secret": secret})
+    assert response.status_code == 200, response.text
+    assert response.json()["processed"] == 1
+    assert len(response.json()["users"]) == 1
+    assert response.json()["users"][0]["status"] == "ok"
+    assert response.json()["users"][0]["new"] == 0
+    assert response.json()["users"][0]["seen"] == 0
+    assert "user_id" not in response.json()["users"][0]

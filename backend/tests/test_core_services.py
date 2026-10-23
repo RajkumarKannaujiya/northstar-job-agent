@@ -7,6 +7,7 @@ from app.services.matching import canonical_job_key, score_job
 from app.services.questions import answer_from_verified_sources, classify_question
 from app.services.resume_parser import extract_text, parse_resume
 from app.services.transitions import transition
+from app.platforms.career_pages import fetch_board, normalize_greenhouse, normalize_lever, validate_board
 from app.core import storage
 from app.core.config import settings
 from cryptography.fernet import Fernet
@@ -104,6 +105,52 @@ def test_captcha_or_mfa_stops_browser_work():
     assert not detector.detect_manual_challenge("Tell us about your work experience")
 
 
+def test_company_career_adapters_normalize_public_jobs_and_keep_submission_manual():
+    greenhouse = normalize_greenhouse({"id": 42, "title": "Data Analyst", "updated_at": "2026-10-22T12:00:00Z", "location": {"name": "Surat"}, "absolute_url": "https://boards.greenhouse.io/demo/jobs/42", "content": "<p>Use SQL and Excel</p><script>ignore()</script>"}, board_token="demo", company_name="Demo Co")
+    assert greenhouse["platform"] == "greenhouse"
+    assert greenhouse["skills"] == ["excel", "sql"]
+    assert "ignore" not in greenhouse["description"]
+    assert greenhouse["application_type"] == "MANUAL"
+    assert greenhouse["application_url"].startswith("https://")
+
+    unsafe_greenhouse = normalize_greenhouse({"id": 43, "absolute_url": "http://evil.example/apply"}, board_token="demo", company_name="Demo Co")
+    assert unsafe_greenhouse["application_url"] == "https://boards.greenhouse.io/demo/jobs/43"
+
+    lever = normalize_lever({"id": "abc", "text": "Backend Engineer", "createdAt": 1792670400000, "categories": {"location": "Remote India", "commitment": "Full-time"}, "descriptionPlain": "Python, FastAPI", "workplaceType": "remote", "hostedUrl": "https://jobs.lever.co/demo/abc", "salaryRange": {"min": 500000, "max": 800000, "currency": "INR"}}, board_token="demo", company_name="Demo Co")
+    assert lever["remote_type"] == "REMOTE"
+    assert lever["salary_min"] == 500000
+    assert lever["employment_type"] == "FULL_TIME"
+    assert lever["application_type"] == "MANUAL"
+    unsafe_lever = normalize_lever({"id": "def", "hostedUrl": "https://evil.example/apply"}, board_token="demo", company_name="Demo Co")
+    assert unsafe_lever["application_url"] == "https://jobs.lever.co/demo/def"
+    try:
+        validate_board("lever", "demo/../../evil.example")
+        assert False, "invalid board token should be rejected"
+    except ValueError:
+        pass
+
+
+def test_company_career_fetch_uses_fixed_official_host_and_normalizes_response():
+    import asyncio
+    import httpx
+
+    async def run():
+        seen = []
+
+        async def handler(request):
+            seen.append(str(request.url))
+            return httpx.Response(200, json={"jobs": [{"id": 7, "title": "Analyst", "location": {"name": "Surat"}, "absolute_url": "https://boards.greenhouse.io/demo/jobs/7", "content": "SQL"}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            rows = await fetch_board("greenhouse", "demo", "Demo Co", client)
+        assert len(rows) == 1
+        assert rows[0]["platform_job_id"] == "demo:7"
+        assert rows[0]["company"] == "Demo Co"
+        assert seen[0].startswith("https://boards-api.greenhouse.io/")
+
+    asyncio.run(run())
+
+
 def test_resume_storage_encrypts_and_round_trips(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_path", str(tmp_path))
     monkeypatch.setattr(settings, "file_encryption_key", Fernet.generate_key().decode())
@@ -113,3 +160,27 @@ def test_resume_storage_encrypts_and_round_trips(tmp_path, monkeypatch):
     assert storage.read_encrypted(key) == b"private resume sample"
     storage.delete_encrypted(key)
     assert not (tmp_path / key).exists()
+
+
+def test_s3_resume_storage_encrypts_before_upload_and_round_trips(monkeypatch):
+    class Body:
+        def __init__(self, value): self.value = value
+        def read(self): return self.value
+
+    class FakeS3:
+        def __init__(self): self.objects = {}
+        def put_object(self, *, Bucket, Key, Body): self.objects[(Bucket, Key)] = Body
+        def get_object(self, *, Bucket, Key): return {"Body": Body(self.objects[(Bucket, Key)])}
+        def delete_object(self, *, Bucket, Key): self.objects.pop((Bucket, Key), None)
+
+    fake = FakeS3()
+    monkeypatch.setattr(storage, "_s3_client", lambda: fake)
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+    monkeypatch.setattr(settings, "s3_bucket", "private-test-bucket")
+    monkeypatch.setattr(settings, "file_encryption_key", Fernet.generate_key().decode())
+    key = storage.save_encrypted(b"private candidate data", ".pdf")
+    uploaded = fake.objects[("private-test-bucket", key)]
+    assert b"private candidate data" not in uploaded
+    assert storage.read_encrypted(key) == b"private candidate data"
+    storage.delete_encrypted(key)
+    assert not fake.objects
