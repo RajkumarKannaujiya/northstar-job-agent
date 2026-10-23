@@ -1,0 +1,95 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobagent
+      POSTGRES_USER: jobagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-local-password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobagent -d jobagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  api:
+    build: ./backend
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql+psycopg://jobagent:${POSTGRES_PASSWORD:-change-this-local-password}@db:5432/jobagent
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-before-deployment}
+      FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-}
+      STORAGE_PATH: /srv/job-agent/private_uploads
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      MAX_RESUME_BYTES: ${MAX_RESUME_BYTES:-10485760}
+    volumes:
+      - encrypted_resumes:/srv/job-agent/private_uploads
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["celery", "-A", "app.workers.celery_app.celery", "worker", "--loglevel=INFO", "--concurrency=2"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql+psycopg://jobagent:${POSTGRES_PASSWORD:-change-this-local-password}@db:5432/jobagent
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-before-deployment}
+      FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-}
+      STORAGE_PATH: /srv/job-agent/private_uploads
+    volumes:
+      - encrypted_resumes:/srv/job-agent/private_uploads
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  scheduler:
+    build: ./backend
+    command: ["celery", "-A", "app.workers.celery_app.celery", "beat", "--loglevel=INFO"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: postgresql+psycopg://jobagent:${POSTGRES_PASSWORD:-change-this-local-password}@db:5432/jobagent
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change-this-before-deployment}
+      FILE_ENCRYPTION_KEY: ${FILE_ENCRYPTION_KEY:-}
+      STORAGE_PATH: /srv/job-agent/private_uploads
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  encrypted_resumes:

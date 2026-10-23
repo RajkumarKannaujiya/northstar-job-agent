@@ -1,0 +1,12 @@
+.env
+backend/.env
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/private_uploads/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/.venv/
+frontend/node_modules/
+*.py[cod]
