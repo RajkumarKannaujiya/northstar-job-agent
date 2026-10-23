@@ -32,7 +32,7 @@ Without Docker, install `backend/requirements.txt`, set `ENVIRONMENT=development
 - Email/password registration and bearer-token authentication with Argon2 password hashing.
 - Structured user profile, preferences, and saved-answer bank.
 - PDF, DOCX, and TXT extraction with conservative resume parsing; extracted fields should be reviewed by the user.
-- Multiple resume support, best-fit resume ranking, user-selected preferred resume, authenticated resume download, and deletion.
+- Multiple resume support, best-fit resume ranking, user-selected preferred resume, authenticated resume download, sab and deletion.
 - Parsed personal, education, experience, and explicit-skill fields are added to empty profile fields; existing user-entered values are not overwritten.
 - Per-job manual resume override.
 - Normalized jobs, source mappings, canonical company/title/location deduplication, match explanations, and missing explicit skills.
@@ -78,6 +78,8 @@ GitHub Pages can publish the static dashboard in frontend/app; it cannot run thi
 After creating the repository, set its Pages build source to GitHub Actions in Settings > Pages. The workflow then deploys the frontend on pushes to main. Set the repository variable `NORTHSTAR_API_URL` to the deployed HTTPS API origin; the workflow injects it into `config.js` at build time.
 
 To connect the dashboard, deploy the API and its database/worker services separately, then set the API origin and `CORS_ORIGINS` to include the Pages URL. Do not put secrets in config.js. Until an API is configured, the page explains that sign-in is unavailable and disables the form. For periodic discovery without a continuously running Celery Beat service, configure `SCHEDULER_SHARED_SECRET` on the API and the matching GitHub Actions secret `NORTHSTAR_SCHEDULER_SECRET`. The scheduled workflow calls only the authenticated internal refresh endpoint; the user must opt in within the dashboard.
+
+For a $0 hobby host that can run this existing full stack, see [`deploy/oracle/README.md`](deploy/oracle/README.md). It uses GitHub Pages for the dashboard and an Oracle Always Free VM for FastAPI, PostgreSQL, Redis, Celery, persistent encrypted resumes, and Caddy HTTPS. It requires the user to create the cloud account, DNS name, and secrets; free-tier capacity and uptime are not guaranteed.
 
 The existing Docker Compose stack is the local full-stack route. A public GitHub Pages site can host only the dashboard. No hosted provider offers this entire stateful FastAPI, PostgreSQL, Redis, Celery, scheduler, and persistent resume-storage stack with a production uptime guarantee at $0. Free plans have limits: for example, Render free web services sleep after 15 minutes of inactivity, free Postgres expires after 30 days, local disks/background workers are unavailable on free compute, and Supabase free projects pause after a week of inactivity. These can support a hobby preview, not reliable long-running job automation or sole-copy resume storage. See [Render free-instance limits](https://render.com/docs/free) and [Supabase pricing](https://supabase.com/pricing). Use backups and durable database/storage before storing irreplaceable personal data.
 

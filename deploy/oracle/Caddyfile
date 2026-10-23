@@ -1,0 +1,8 @@
+{$NORTHSTAR_API_DOMAIN} {
+	encode zstd gzip
+
+	@private_metrics path /metrics /metrics/*
+	respond @private_metrics 404
+
+	reverse_proxy api:8000
+}
