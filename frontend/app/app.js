@@ -260,11 +260,11 @@ $("discover").onclick = async () => {
 };
 $("view-jobs").onclick = () => { state.showAllJobs = !state.showAllJobs; renderJobs(); };
 $("open-all-platforms").onclick = () => {
-  for (const name of ["Naukri", "Indeed", "Apna", "LinkedIn"]) {
+  for (const name of ["Naukri", "Indeed", "Apna"]) {
     const url = state.providerSearchUrls[name];
     if (url) window.open(url, "_blank", "noopener,noreferrer");
   }
-  showMessage("message", "Opened the four filtered search pages where your browser allowed new tabs. Sign in on each provider; review and submit applications there.");
+  showMessage("message", "Opened Naukri, Indeed, and Apna searches where your browser allowed new tabs. Sign in on each provider; review and submit applications there.");
 };
 $("view-applications").onclick = () => { state.showAllApplications = !state.showAllApplications; renderApps(); };
 $("save-preferences").onclick = async () => {
