@@ -2,7 +2,7 @@ const localDevelopment = ["localhost", "127.0.0.1"].includes(location.hostname) 
 const API = String(window.NORTHSTAR_API_URL || (localDevelopment ? "http://localhost:8000" : "")).replace(/\/+$/, "");
 const API_READY = Boolean(API);
 const tokenKey = "northstar_session";
-const state = {jobs: [], applications: [], resumes: [], boards: [], platforms: [], notifications: [], profile: {}, showAllJobs: false, showAllApplications: false};
+const state = {jobs: [], applications: [], resumes: [], boards: [], platforms: [], notifications: [], profile: {}, providerSearchUrls: {}, showAllJobs: false, showAllApplications: false};
 const token = () => sessionStorage.getItem(tokenKey);
 const $ = (id) => document.getElementById(id);
 
@@ -155,6 +155,7 @@ function renderPlatformSearchLinks() {
     ["Naukri", `https://www.naukri.com/${slug(title) ? `${slug(title)}-jobs-in-` : "jobs-in-"}${slug(location.toLowerCase().includes("remote") ? "india" : location) || "india"}`],
     ["Indeed", indeed.href], ["Apna", apna.href], ["LinkedIn", linkedin.href],
   ];
+  state.providerSearchUrls = Object.fromEntries(links);
   box.innerHTML = links.map(([name, url]) => `<a class="platform-search-link" href="${safeUrl(url)}" target="_blank" rel="noopener noreferrer">${esc(name)} ↗</a>`).join("");
 }
 
@@ -258,6 +259,13 @@ $("discover").onclick = async () => {
   finally { button.disabled = false; button.textContent = "Search job feeds"; }
 };
 $("view-jobs").onclick = () => { state.showAllJobs = !state.showAllJobs; renderJobs(); };
+$("open-all-platforms").onclick = () => {
+  for (const name of ["Naukri", "Indeed", "Apna", "LinkedIn"]) {
+    const url = state.providerSearchUrls[name];
+    if (url) window.open(url, "_blank", "noopener,noreferrer");
+  }
+  showMessage("message", "Opened the four filtered search pages where your browser allowed new tabs. Sign in on each provider; review and submit applications there.");
+};
 $("view-applications").onclick = () => { state.showAllApplications = !state.showAllApplications; renderApps(); };
 $("save-preferences").onclick = async () => {
   try {
